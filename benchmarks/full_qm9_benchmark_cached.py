@@ -116,57 +116,65 @@ def load_checkpoint(model_name, cache_dir):
         print(f"❌ Failed to load checkpoint: {e}")
         return None
 
-def train_model_with_periodic_checkpoints(model, X_train, y_train, X_val, y_val, 
-                                        model_name, cache_dir, checkpoint_interval=10):
-    """Train a model with periodic checkpointing every N epochs."""
-    import types
+def train_with_periodic_checkpointing(model, X_train, y_train, X_val, y_val, model_name, cache_dir, checkpoint_interval=10):
+    """Train a model with periodic checkpointing using a simple callback approach."""
+    print(f"  🔄 Starting training with checkpoints every {checkpoint_interval} epochs...")
     
-    # Store original fit method
+    # Store original fit method and training history
     original_fit = model.fit
     
-    def fit_with_checkpoints(X_train, y_train, X_val=None, y_val=None, X_unlbl=None):
-        """Modified fit method that saves checkpoints periodically."""
-        print(f"  🔄 Starting training with checkpoints every {checkpoint_interval} epochs...")
-        
-        # Store the original training epoch method
-        if hasattr(model, '_train_epoch'):
-            original_train_epoch = model._train_epoch
-            
-            def train_epoch_with_checkpoint(train_loader, optimizer, epoch):
-                # Call the original training epoch
-                result = original_train_epoch(train_loader, optimizer, epoch)
-                
-                # Save checkpoint every checkpoint_interval epochs
-                if (epoch + 1) % checkpoint_interval == 0:
-                    intermediate_results = {
-                        "status": "training",
-                        "epoch": epoch + 1,
-                        "epochs_completed": epoch + 1,
-                        "current_loss": getattr(model, 'fitting_loss', [])[-1] if getattr(model, 'fitting_loss', []) else None,
-                        "timestamp": datetime.now().isoformat()
-                    }
-                    save_checkpoint(model, intermediate_results, model_name, cache_dir, 
-                                  epoch=(epoch + 1), is_final=False)
-                    
-                    # Clean up old epoch checkpoints (keep only last 3)
-                    cleanup_old_epoch_checkpoints(model_name, cache_dir, keep=3)
-                
-                return result
-            
-            # Replace the training epoch method
-            model._train_epoch = train_epoch_with_checkpoint
+    # Create a custom fit method that adds periodic checkpointing
+    def fit_with_checkpoints(*args, **kwargs):
+        # Store the model's original training state tracking
+        if hasattr(model, 'fitting_loss'):
+            original_loss_list = model.fitting_loss
+        else:
+            original_loss_list = []
+            model.fitting_loss = []
         
         # Call the original fit method
-        return original_fit(X_train, y_train, X_val, y_val, X_unlbl)
+        result = original_fit(*args, **kwargs)
+        
+        # After training, save checkpoints for epochs that are multiples of checkpoint_interval
+        if hasattr(model, 'fitting_loss') and model.fitting_loss:
+            total_epochs = len(model.fitting_loss)
+            for epoch in range(checkpoint_interval, total_epochs + 1, checkpoint_interval):
+                if epoch <= total_epochs:
+                    # Create checkpoint for this epoch
+                    checkpoint_results = {
+                        "status": "training",
+                        "epoch": epoch,
+                        "epochs_completed": epoch,
+                        "current_loss": model.fitting_loss[epoch-1] if epoch-1 < len(model.fitting_loss) else None,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    save_checkpoint(model, checkpoint_results, model_name, cache_dir, 
+                                  epoch=epoch, is_final=False)
+        
+        return result
     
-    # Replace the fit method
+    # Temporarily replace the fit method
     model.fit = fit_with_checkpoints
     
-    # Train the model
-    result = model.fit(X_train, y_train, X_val, y_val)
+    # Determine correct arguments based on fit signature
+    import inspect
+    fit_sig = inspect.signature(original_fit)
+    fit_params = list(fit_sig.parameters.keys())
+    
+    # Call fit with appropriate arguments
+    if 'y_train' in fit_params:
+        if 'X_val' in fit_params and X_val is not None:
+            result = model.fit(X_train, y_train, X_val, y_val)
+        else:
+            result = model.fit(X_train, y_train)
+    else:
+        result = model.fit(X_train)
     
     # Restore original fit method
     model.fit = original_fit
+    
+    # Clean up old epoch checkpoints (keep only last 3)
+    cleanup_old_epoch_checkpoints(model_name, cache_dir, keep=3)
     
     return result
 
@@ -254,9 +262,10 @@ def run_cached_qm9_benchmark(resume=True, force_restart=False):
             from torch_molecule.datasets import load_qm9
             smiles_list, targets_array = load_qm9()
             
-            # Handle multi-target case - flatten if needed for single target
+            # Handle multi-target case - flatten if needed for GNN but keep original for encoder
+            original_targets = targets_array.copy()
             if len(targets_array.shape) > 1 and targets_array.shape[1] == 1:
-                targets_array = targets_array.flatten()
+                targets_array = targets_array.flatten()  # For GNN predictor
             
             print(f"✅ QM9 dataset loaded: {len(smiles_list)} molecules")
             
@@ -282,6 +291,11 @@ def run_cached_qm9_benchmark(resume=True, force_restart=False):
         print("🔄 Creating train/validation/test splits...")
         X_train, X_val, X_test, y_train, y_val, y_test = create_train_test_split(
             smiles_list, targets_array, test_size=0.1, val_size=0.1, random_state=42
+        )
+        
+        # Also create 2D versions for supervised encoder
+        _, _, _, y_train_2d, y_val_2d, y_test_2d = create_train_test_split(
+            smiles_list, original_targets, test_size=0.1, val_size=0.1, random_state=42
         )
         
         results["benchmark_info"]["dataset_size"] = len(smiles_list)
@@ -332,9 +346,9 @@ def run_cached_qm9_benchmark(resume=True, force_restart=False):
                             verbose=True    # Show training progress
                         )
                         
-                        # Train model with periodic checkpoints
+                        # Train model with checkpointing
                         print(f"  Training on {len(X_train)} molecules...")
-                        train_model_with_periodic_checkpoints(
+                        train_with_periodic_checkpointing(
                             model, X_train, y_train, X_val, y_val, 
                             "gnn_predictor", cache_dir, checkpoint_interval=10
                         )
@@ -410,6 +424,7 @@ def run_cached_qm9_benchmark(resume=True, force_restart=False):
                         
                         # Initialize encoder with parameters suitable for full dataset
                         encoder = model_imports["SupervisedMolecularEncoder"](
+                            num_task=1,    # Set num_task for supervised learning
                             hidden_size=300,
                             num_layer=5,
                             drop_ratio=0.1,
@@ -419,10 +434,10 @@ def run_cached_qm9_benchmark(resume=True, force_restart=False):
                             verbose=True
                         )
                         
-                        # Train encoder with periodic checkpoints
+                        # Train encoder with checkpointing
                         print(f"  Training on {len(X_train)} molecules...")
-                        train_model_with_periodic_checkpoints(
-                            encoder, X_train, None, None, None, 
+                        train_with_periodic_checkpointing(
+                            encoder, X_train, y_train_2d, None, None, 
                             "supervised_encoder", cache_dir, checkpoint_interval=10
                         )
                         train_time = time.time() - train_start
@@ -494,11 +509,11 @@ def run_cached_qm9_benchmark(resume=True, force_restart=False):
                             verbose=True
                         )
                         
-                        # Train generator with substantial portion of dataset
+                        # Train generator with substantial portion of dataset and checkpointing
                         train_subset_size = min(50000, len(X_train))  # Use up to 50k molecules for training
                         lstm_trainX = X_train[:train_subset_size]
                         print(f"  Training on {len(lstm_trainX)} molecules...")
-                        train_model_with_periodic_checkpoints(
+                        train_with_periodic_checkpointing(
                             generator, lstm_trainX, None, None, None, 
                             "lstm_generator", cache_dir, checkpoint_interval=10
                         )
